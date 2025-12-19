@@ -36,8 +36,9 @@ module emu
 	output        CE_PIXEL,
 
 	//Video aspect ratio for HDMI. Most retro systems have ratio 4:3.
-	output  [7:0] VIDEO_ARX,
-	output  [7:0] VIDEO_ARY,
+	//if VIDEO_ARX[12] or VIDEO_ARY[12] is set then [11:0] contains scaled size instead of aspect ratio.
+	output [12:0] VIDEO_ARX,
+	output [12:0] VIDEO_ARY,
 
 	output  [7:0] VGA_R,
 	output  [7:0] VGA_G,
@@ -55,6 +56,35 @@ module emu
 	output        HDMI_FREEZE,
 	output        HDMI_BLACKOUT,
 	output        HDMI_BOB_DEINT,
+
+`ifdef MISTER_FB
+	// Use framebuffer in DDRAM
+	// FB_FORMAT:
+	//    [2:0] : 011=8bpp(palette) 100=16bpp 101=24bpp 110=32bpp
+	//    [3]   : 0=16bits 565 1=16bits 1555
+	//    [4]   : 0=RGB  1=BGR (for 16/24/32 modes)
+	//
+	// FB_STRIDE either 0 (rounded to 256 bytes) or multiple of pixel size (in bytes)
+	output        FB_EN,
+	output  [4:0] FB_FORMAT,
+	output [11:0] FB_WIDTH,
+	output [11:0] FB_HEIGHT,
+	output [31:0] FB_BASE,
+	output [13:0] FB_STRIDE,
+	input         FB_VBL,
+	input         FB_LL,
+	output        FB_FORCE_BLANK,
+
+`ifdef MISTER_FB_PALETTE
+	// Palette control for 8bit modes.
+	// Ignored for other video modes.
+	output        FB_PAL_CLK,
+	output  [7:0] FB_PAL_ADDR,
+	output [23:0] FB_PAL_DOUT,
+	input  [23:0] FB_PAL_DIN,
+	output        FB_PAL_WR,
+`endif
+`endif
 
 	output        LED_USER,  // 1 - ON, 0 - OFF.
 
@@ -111,6 +141,20 @@ module emu
 	output        SDRAM_nRAS,
 	output        SDRAM_nWE,
 
+`ifdef MISTER_DUAL_SDRAM
+	//Secondary SDRAM
+	//Set all output SDRAM_* signals to Z ASAP if SDRAM2_EN is 0
+	input         SDRAM2_EN,
+	output        SDRAM2_CLK,
+	output [12:0] SDRAM2_A,
+	output  [1:0] SDRAM2_BA,
+	inout  [15:0] SDRAM2_DQ,
+	output        SDRAM2_nCS,
+	output        SDRAM2_nCAS,
+	output        SDRAM2_nRAS,
+	output        SDRAM2_nWE,
+`endif
+
 	input         UART_CTS,
 	output        UART_RTS,
 	input         UART_RXD,
@@ -138,7 +182,7 @@ assign {UART_RTS, UART_DTR} = 0;
 
 //assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 assign {SDRAM_DQ, SDRAM_A, SDRAM_BA, SDRAM_CLK, SDRAM_CKE, SDRAM_DQML, SDRAM_DQMH, SDRAM_nWE, SDRAM_nCAS, SDRAM_nRAS, SDRAM_nCS} = 'Z;
-assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = '0;  
+assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = '0;
 
 assign VGA_SL = 0;
 assign VGA_F1 = 0;
@@ -155,30 +199,34 @@ wire LED_GREEN;
 wire LED_YELLOW;
 wire LED_RED;
 
-assign LED_POWER = { 1'b1, LED_GREEN };	
-assign LED_USER = LED_RED;
-assign LED_DISK = { 1'b1, LED_YELLOW };	
-assign BUTTONS = 0;
+assign LED_POWER = { 1'b1, LED_GREEN };
+assign LED_USER  = LED_RED;
+assign LED_DISK  = { 1'b1, LED_YELLOW };
+assign BUTTONS   = 0;
 
 
 //////////////////////////////////////////////////////////////////
 
 assign VIDEO_ARX = 8'd4;
-assign VIDEO_ARY = 8'd3; 
+assign VIDEO_ARY = 8'd3;
 
-`include "build_id.v" 
+`include "build_id.v"
 localparam CONF_STR = {
-	"Ondra_SPO186;;",	
-	"-;",	
-	"O56,ROM,ViLi,Tesla v5,Test ROM;",				
-	"O7,ADC line pass through,On,Off;",
-	"-;",	
-	"R0,Reset Ondra;",	
-	"J,Fire 1;",
-	"V,v",`BUILD_DATE 
+   "Ondra SPO 186;;",
+   "-;",
+   "O56,ROM,ViLi,Tesla v5,Ondra PLUS 1.4,Test ROM;",
+   "-;",
+   "O7,ADC line pass through,On,Off;",
+   "O8,Cassette out to audio,On,Off;",
+   "-;",
+   "O9,Ondra SD,On,Off;",
+   "OA,Ondra Melodik,On,Off;",
+   "-;",
+   "R0,Reset Ondra;",
+   "J,Fire 1;",
+   "V,v",`BUILD_DATE
 };
 
-wire forced_scandoubler;
 wire  [1:0] buttons;
 wire [31:0] status;
 wire [10:0] ps2_key;
@@ -192,28 +240,24 @@ wire  [7:0] ioctl_index;
 wire [15:0] joy;
 // RTC MSM6242B layout
 (* keep *) wire [64:0] RTC;
-	
-	
-hps_io #(.CONF_STR(CONF_STR)) hps_io
+
+
+hps_io #(.CONF_STR(CONF_STR), .STRLEN($size(CONF_STR)>>3)) hps_io
 (
-	.clk_sys(clk_sys),
-	.HPS_BUS(HPS_BUS),
-	.EXT_BUS(),
-	.gamma_bus(),
+   .clk_sys(clk_sys),
+   .HPS_BUS(HPS_BUS),
 
-	.forced_scandoubler(forced_scandoubler),
+   .buttons(buttons),
+   .status(status),
+   .ps2_key(ps2_key),
+   .joystick_0(joy),
+   .RTC(RTC),
 
-	.buttons(buttons),
-	.status(status),
-	.ps2_key(ps2_key),
-	.joystick_0(joy),
-	.RTC(RTC),
-
-	.ioctl_wr(ioctl_wr),
-	.ioctl_addr(ioctl_addr),
-	.ioctl_dout(ioctl_data),
-	.ioctl_download(ioctl_download),
-	.ioctl_index(ioctl_index)  
+   .ioctl_wr(ioctl_wr),
+   .ioctl_addr(ioctl_addr),
+   .ioctl_dout(ioctl_data),
+   .ioctl_download(ioctl_download),
+   .ioctl_index(ioctl_index)
 );
 
 
@@ -222,57 +266,57 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 //  Clocks
 //
 wire locked;
-wire clk_sys;  // 8 MHz clock
-wire clk_snen; // 4 MHz
+wire clk_sys;  // 8 MHz Ondra sys clock
+wire clk_snen; // 4 MHz Ondra MELODIK - sn76489_audio
 
 pll pll
 (
-	.refclk(CLK_50M),
-	.rst(0),
-	.outclk_0(clk_sys),
-	.outclk_1(clk_snen),
-	.locked(locked)
+   .refclk(CLK_50M),
+   .rst(0),
+   .outclk_0(clk_sys),
+   .outclk_1(clk_snen),
+   .locked(locked)
 );
 
 wire reset = RESET | status[0] | buttons[1];
 
 
 //-------------------------------------------------------------------------------
-//  Cassette audio in 
+//  Cassette audio in
 //
-  
 wire tape_adc, tape_adc_act;
+
 ltc2308_tape ltc2308_tape
 (
-	.clk(CLK_50M),
-	.ADC_BUS(ADC_BUS),
-	.dout(tape_adc),
-	.active(tape_adc_act)
-);  
+   .clk(CLK_50M),
+   .ADC_BUS(ADC_BUS),
+   .dout(tape_adc),
+   .active(tape_adc_act)
+);
 
 
 //-------------------------------------------------------------------------------
 //  Ondra MELODIK - sn76489_audio
 //
-
-wire [7:0] Parallel_Data_OUT;	
-wire NON_STB;
+wire  [7:0] Parallel_Data_OUT;
+wire        NON_STB;
 wire [13:0] mix_audio_o;
-reg  ondra_melodik_clk_enable;
+reg         ondra_melodik_clk_enable;
+
 
 always @(posedge reset or negedge NON_STB)
 begin
   if (reset)
-    ondra_melodik_clk_enable <= 0;
+    ondra_melodik_clk_enable <= 1'b0;
   else
-    ondra_melodik_clk_enable <= 1;
+    ondra_melodik_clk_enable <= 1'b1 & ~status[10];
 end
 
 sn76489_audio #(.MIN_PERIOD_CNT_G(17)) sn76489_audio
 (  .clk_i(clk_sys),                                     //System clock
    .en_clk_psg_i(clk_snen & ondra_melodik_clk_enable),  //PSG clock enable
    .ce_n_i(0),                                          //chip enable, active low
-   .wr_n_i(NON_STB),                                    // write enable, active low   
+   .wr_n_i(NON_STB),                                    // write enable, active low
    .data_i(Parallel_Data_OUT),
    .mix_audio_o(mix_audio_o)
 );
@@ -282,31 +326,31 @@ sn76489_audio #(.MIN_PERIOD_CNT_G(17)) sn76489_audio
 //  Keyboard controls
 //
 
-reg kbd_reset = 0;
-reg kbd_ROM_change = 0;
-reg kbd_scandoublerOverride = 0;
-reg old_stb = 0;    
-reg kbd_enter = 0;
+reg kbd_reset               = 1'b0;
+reg kbd_ROM_change          = 1'b0;
+reg kbd_scandoublerOverride = 1'b0;
+reg old_stb                 = 1'b0;
+reg kbd_enter               = 1'b0;
 
-wire pressed = ps2_key[9];
-wire input_strobe = ps2_key[10];
-wire extended = ps2_key[8];
-wire [7:0] scancode = ps2_key[7:0];	
+wire       pressed      = ps2_key [9];
+wire       input_strobe = ps2_key[10];
+wire       extended     = ps2_key [8];
+wire [7:0] scancode     = ps2_key[7:0];
 
-always @(posedge clk_sys) 
+always @(posedge clk_sys)
 begin
-	old_stb <= input_strobe;
+   old_stb <= input_strobe;
    if ((old_stb != input_strobe) & (~extended))
-	begin		
+   begin
       case(scancode)
-//         8'h03: kbd_reset <= pressed;         // F5 = RESET   
+//         8'h03: kbd_reset <= pressed;         // F5 = RESET
 //         8'h01: kbd_ROM_change <= pressed;    // F9 =  change ROM & reset!
-         8'h5a : kbd_enter <= pressed; // ENTER         
-      endcase	
+         8'h5a : kbd_enter <= pressed; // ENTER
+      endcase
    end
-end	
-      
-		
+end
+
+
 //-------------------------------------------------------------------------------
 //  Ondra SD
 //
@@ -315,11 +359,11 @@ wire OndraSD_signal_led;
 wire OndraSD_rxd;
 wire OndraSD_txd;
 
-OndraSD #(.sysclk_frequency(50000000)) OndraSD // 50MHz
+OndraSD #(.sysclk_frequency(50_000_000)) OndraSD // 50MHz
 (
    .clk(CLK_50M),
    .reset_in(~reset),
-   .enter_key(kbd_enter),
+   .enter_key(kbd_enter & ~status[9]),
    .signal_led(OndraSD_signal_led),
    // SPI signals
    .spi_miso(SD_MISO),
@@ -329,64 +373,73 @@ OndraSD #(.sysclk_frequency(50000000)) OndraSD // 50MHz
    // UART
    .rxd(OndraSD_rxd),
    .txd(OndraSD_txd)
-); 
- 
+);
+
 assign LED_RED = ~SD_CS;
 
 
 //-------------------------------------------------------------------------------
 //  Ondra core
 //
-
-wire HSync;
-wire VSync;
-wire HBlank;
-wire VBlank;
-wire pixel;
-wire beeper;
-wire TXD;
+wire       clk_video;
+wire       HSync;
+wire       VSync;
+wire       HBlank;
+wire       VBlank;
+wire       pixel;
+wire       beeper;
+wire       TXD;
+wire       MGF_OUT;
+wire [4:0] joystick  = { (joy[7:4] == 4'b0000), ~joy[2], ~joy[3], ~joy[1], ~joy[0] }; // FIRE DOWN UP LEFT RIGHT
 
 
 Ondra_SPO186_core Ondra_SPO186_core
 (
-	.clk_50M(CLK_50M),
-	.clk_sys(clk_sys),
-	.reset(reset),	
-	.ps2_key(ps2_key),
-	.HSync(HSync),
-	.VSync(VSync),	
-	.HBlank(HBlank),
-	.VBlank(VBlank),
-	.pixel(pixel),
-	.beeper(beeper),
-	.LED_GREEN(LED_GREEN),
-	.LED_YELLOW(LED_YELLOW),
-	//.RELAY(LED_RED), // red led will indicate RELAY activity
-	.joy(joy),
-	.RESERVA_IN(OndraSD_txd), //rxd
-	.RESERVA_OUT(OndraSD_rxd), // txd
-	.MGF_IN(tape_adc),
-	.ROMVersion(status[6:5]),
-	.Parallel_Data_OUT(Parallel_Data_OUT),	
-   .NON_STB(NON_STB)	
+   .clk_50M(CLK_50M),
+   .clk_sys(clk_sys),
+   .reset(reset),
+   .ps2_key(ps2_key),
+   .joystick(joystick),
+
+   .clk_video(clk_video),
+   .HSync(HSync),
+   .VSync(VSync),
+   .HBlank(HBlank),
+   .VBlank(VBlank),
+   .pixel(pixel),
+   .beeper(beeper),
+
+   .LED_GREEN(LED_GREEN),
+   .LED_YELLOW(LED_YELLOW),
+   //.RELAY(LED_RED), // red led will indicate RELAY activity
+
+   .RESERVA_IN(OndraSD_txd),  //rxd
+   .RESERVA_OUT(OndraSD_rxd), // txd
+   .MGF_IN(tape_adc),
+   .MGF_OUT(MGF_OUT),
+   .Parallel_Data_OUT(Parallel_Data_OUT),
+   .NON_STB(NON_STB),
+
+   .ROMVersion(status[6:5])
 );
 
 
-assign AUDIO_L = (beeper ? 16'h0FFF : 16'h00) | 
-					  (~status[7] & tape_adc ? 16'h07F0 : 16'h00) |
-					  { 2'b00, mix_audio_o };
-assign AUDIO_R = (beeper ? 16'h0FFF : 16'h00) | 
-					  (~status[7] & tape_adc ? 16'h07F0 : 16'h00) |
-					  { 2'b00, mix_audio_o };
-					  
-assign CLK_VIDEO = clk_sys;
-assign CE_PIXEL = 1;
-assign VGA_R = pixel ? 8'hFF : 8'h00;
-assign VGA_G = pixel ? 8'hFF : 8'h00;
-assign VGA_B = pixel ? 8'hFF : 8'h00;
-assign VGA_HS = HSync;
-assign VGA_VS = VSync;
-assign VGA_DE = ~(HBlank | VBlank);
+assign AUDIO_L = (beeper ? 16'h0FFF : 16'h00) |
+                 (~status[7] & tape_adc ? 16'h07F0 : 16'h00) |
+                 (~status[8] & MGF_OUT  ? 16'h07F0 : 16'h00) |
+                 { 2'b00, mix_audio_o };
+assign AUDIO_R = (beeper ? 16'h0FFF : 16'h00) |
+                 (~status[7] & tape_adc ? 16'h07F0 : 16'h00) |
+                 (~status[8] & MGF_OUT  ? 16'h07F0 : 16'h00) |
+                 { 2'b00, mix_audio_o };
 
+assign CLK_VIDEO = clk_sys;
+assign CE_PIXEL  = 1'b1;
+assign VGA_R     = pixel ? 8'hFF : 8'h00;
+assign VGA_G     = pixel ? 8'hFF : 8'h00;
+assign VGA_B     = pixel ? 8'hFF : 8'h00;
+assign VGA_HS    = HSync;
+assign VGA_VS    = VSync;
+assign VGA_DE    = ~(HBlank | VBlank);
 
 endmodule
